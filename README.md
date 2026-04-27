@@ -59,7 +59,7 @@ sudo visudo
 ```
 Add the following line at the end of the file (replace `your_username` and `/path/to/...` with your actual username and absolute path to the script):
 ```text
-your_username ALL=(ALL) NOPASSWD: /usr/bin/python3 /absolute/path/to/aircrak-mcp/aircrackmcp.py
+your_username ALL=(ALL) NOPASSWD: /usr/bin/python3 /absolute/path/to/aircrack-mcp/aircrackmcp.py
 ```
 
 ## Usage
