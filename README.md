@@ -81,7 +81,7 @@ Add this to your MCP client config (e.g. `claude_desktop_config.json`):
       "command": "sudo",
       "args": [
         "python3",
-        "/absolute/path/to/aircrak-mcp/aircrackmcp.py"
+        "/absolute/path/to/aircrack-mcp/aircrackmcp.py"
       ]
     }
   }
