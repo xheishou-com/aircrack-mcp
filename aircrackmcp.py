@@ -2,8 +2,7 @@
 Aircrack-ng MCP Server
 ======================
 Developed by: Anil Parashar (TechChip)
-YouTube: https://www.youtube.com/@techchipnet
-Website: https://www.techchip.net
+Website: https://xheishou.com
 
 A Model Context Protocol (MCP) server that wraps the aircrack-ng suite.
 Communicates via JSON-RPC 2.0 over stdio.
@@ -33,6 +32,14 @@ import subprocess
 import re
 import os
 import logging
+import argparse
+import threading
+import queue
+import uuid
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse, parse_qs
 
 # ---------------------------------------------------------------------------
 # Logging — MCP spec: stdout is protocol-only, logs go to stderr
@@ -843,11 +850,175 @@ def handle_request(req: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# SSE Transport (HTTP + Server-Sent Events)
+# ---------------------------------------------------------------------------
+# Session management for SSE connections
+_sessions: dict[str, queue.Queue] = {}
+_sessions_lock = threading.Lock()
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """HTTP server with threading support for concurrent connections."""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class SSERequestHandler(BaseHTTPRequestHandler):
+    """HTTP request handler implementing MCP SSE transport."""
+
+    server_version = f"{SERVER_NAME}/{SERVER_VERSION}"
+    # Disable request logging to stderr
+    def log_message(self, fmt, *args):
+        log.debug("HTTP: %s", fmt % args)
+
+    def _send_sse(self, wfile, event: str, data: str):
+        """Send an SSE formatted message."""
+        msg = f"event: {event}\ndata: {data}\n\n"
+        wfile.write(msg.encode("utf-8"))
+        wfile.flush()
+
+    def _send_json_rpc_sse(self, wfile, response: dict):
+        """Send a JSON-RPC response as an SSE message event."""
+        self._send_sse(wfile, "message", json.dumps(response))
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+
+        # ---- /health ----
+        if parsed.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "server": SERVER_NAME}).encode())
+            return
+
+        # ---- /sse ----
+        if parsed.path == "/sse":
+            session_id = str(uuid.uuid4())
+            msg_queue: queue.Queue = queue.Queue()
+
+            with _sessions_lock:
+                _sessions[session_id] = msg_queue
+
+            log.info("SSE session created: %s", session_id)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            try:
+                # Send the endpoint event so client knows where to POST
+                self._send_sse(self.wfile, "endpoint", f"/messages?sessionId={session_id}")
+
+                # Keep connection open and forward responses from queue
+                while True:
+                    try:
+                        response = msg_queue.get(timeout=30)
+                        self._send_json_rpc_sse(self.wfile, response)
+                    except queue.Empty:
+                        # Send heartbeat comment to keep connection alive
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                log.info("SSE client disconnected: %s", session_id)
+            finally:
+                with _sessions_lock:
+                    _sessions.pop(session_id, None)
+                log.info("SSE session removed: %s", session_id)
+            return
+
+        # ---- 404 ----
+        self.send_error(404, "Not Found")
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+
+        # ---- /messages?sessionId=xxx ----
+        if parsed.path == "/messages":
+            params = parse_qs(parsed.query)
+            session_ids = params.get("sessionId", [])
+            if not session_ids:
+                self.send_error(400, "Missing sessionId parameter")
+                return
+            session_id = session_ids[0]
+
+            with _sessions_lock:
+                msg_queue = _sessions.get(session_id)
+
+            if msg_queue is None:
+                self.send_error(404, "Session not found or expired")
+                return
+
+            # Read request body
+            content_length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(content_length).decode("utf-8")
+
+            try:
+                req = json.loads(body)
+            except json.JSONDecodeError:
+                err = make_error(None, PARSE_ERROR, "Invalid JSON")
+                msg_queue.put(err)
+                self.send_response(200)
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(b'{"status":"accepted"}')
+                return
+
+            # Handle the request
+            response = handle_request(req)
+
+            if response is not None:
+                msg_queue.put(response)
+
+            # Acknowledge receipt
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(b'{"status":"accepted"}')
+            return
+
+        # ---- 404 ----
+        self.send_error(404, "Not Found")
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+
+# ---------------------------------------------------------------------------
+# SSE main
+# ---------------------------------------------------------------------------
+def sse_main(host: str, port: int):
+    """Run the MCP server in SSE (HTTP) transport mode."""
+    server = ThreadingHTTPServer((host, port), SSERequestHandler)
+    log.info(
+        "Aircrack-ng MCP server (SSE transport) listening on http://%s:%d",
+        host, port,
+    )
+    log.info("SSE endpoint: http://%s:%d/sse", host, port)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        log.info("Server shutting down...")
+        server.shutdown()
+
+
+# ---------------------------------------------------------------------------
 # Main stdio loop
 # ---------------------------------------------------------------------------
-def main():
+def stdio_main():
     """MCP stdio transport: read JSON-RPC from stdin, write to stdout."""
-    log.info("Aircrack-ng MCP server started (protocol %s)", PROTOCOL_VERSION)
+    log.info("Aircrack-ng MCP server started (stdio transport, protocol %s)", PROTOCOL_VERSION)
 
     for line in sys.stdin:
         line = line.strip()
@@ -883,6 +1054,46 @@ def main():
             sys.stdout.flush()
 
     log.info("Server shutting down.")
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"{SERVER_NAME} - MCP Server for Aircrack-ng",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  %(prog)s                              (stdio mode, default)\n"
+            "  %(prog)s --transport sse --port 8080  (HTTP/SSE mode for remote access)\n"
+            "  %(prog)s --transport sse --host 0.0.0.0 --port 9090\n"
+        ),
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="Transport protocol (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default="0.0.0.0",
+        help="Bind address for SSE mode (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8080,
+        help="Listen port for SSE mode (default: 8080)",
+    )
+
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        sse_main(args.host, args.port)
+    else:
+        stdio_main()
 
 
 if __name__ == "__main__":
