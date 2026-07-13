@@ -1,7 +1,7 @@
 # Aircrack-ng MCP Server
 
 **开发者: Anil Parashar (TechChip)**  
-**网站:** [techchip.net](https://xheishou.com)
+**网站:** [X黑手网](https://xheishou.com)
 
 
 Aircrack-MCP 是一个 Model Context Protocol (MCP) 服务端，让大语言模型能够与 Aircrack-ng 工具交互。
